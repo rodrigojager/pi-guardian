@@ -18,9 +18,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ const UNSAFE_SHELL_SYNTAX = /[<>`]|\$\(/;
 // Project override -> user override -> bundled Codex default policy.
 const PROJECT_POLICY_PATH = ".pi/guardian-policy.md";
 const USER_POLICY_PATH = join(homedir(), ".pi", "agent", "guardian-policy.md");
+const SETTINGS_PATH = join(homedir(), ".pi", "agent", "pi-guardian.json");
 
 /** Set PI_GUARDIAN_LOG=/path/to/file to append one JSON line per review. */
 const GUARDIAN_LOG_PATH = process.env.PI_GUARDIAN_LOG;
@@ -102,7 +104,24 @@ interface GuardianStats {
 // Prompt assembly
 // ---------------------------------------------------------------------------
 
-const extensionDir = new URL(".", import.meta.url).pathname;
+// URL.pathname is not a Windows path (it begins with /C:/), which made
+// path.join produce C:\\C:\\... and blocked every reviewed call fail-closed.
+const extensionDir = dirname(fileURLToPath(import.meta.url));
+
+function loadEnabled(): boolean {
+	try {
+		const saved = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as { enabled?: unknown };
+		return typeof saved.enabled === "boolean" ? saved.enabled : true;
+	} catch {
+		return true;
+	}
+}
+
+function saveEnabled(enabled: boolean) {
+	const temporary = `${SETTINGS_PATH}.${process.pid}.tmp`;
+	writeFileSync(temporary, JSON.stringify({ enabled }, null, 2), "utf8");
+	renameSync(temporary, SETTINGS_PATH);
+}
 
 function loadPolicyTemplate(): string {
 	return readFileSync(join(extensionDir, "policy", "policy_template.md"), "utf8");
@@ -501,7 +520,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 	const guardianSessionId = randomUUID();
 	const stats: GuardianStats = { reviews: 0, allowed: 0, denied: 0, overridden: 0, failures: 0 };
 
-	let enabled = true;
+	let enabled = loadEnabled();
 	let breakerTripped = false;
 	let consecutiveDenials = 0;
 	const denialWindow: boolean[] = [];
@@ -613,7 +632,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		setStatus(ctx, "guardian: auto");
+		setStatus(ctx, enabled ? "guardian: auto" : "guardian: off");
 	});
 
 	pi.on("before_agent_start", async () => {
@@ -697,6 +716,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 			const arg = (args ?? "").trim();
 			if (arg === "on") {
 				enabled = true;
+				saveEnabled(true);
 				breakerTripped = false;
 				consecutiveDenials = 0;
 				denialWindow.length = 0;
@@ -706,6 +726,7 @@ export default function guardianExtension(pi: ExtensionAPI) {
 			}
 			if (arg === "off") {
 				enabled = false;
+				saveEnabled(false);
 				setStatus(ctx, "guardian: off");
 				ctx.ui.notify("Guardian disabled", "warning");
 				return;
